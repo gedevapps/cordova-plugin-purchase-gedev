@@ -1678,8 +1678,8 @@ var CdvPurchase;
 (function (CdvPurchase) {
     /**
      * Persist a subset of {@link VerifiedPurchase} to device storage so that
-     * `store.owned()` works when the device is offline or has just restarted
-     * without connectivity.
+     * `offline.isOwned()` can answer "is this product owned?" when the device
+     * is offline or has just restarted without connectivity.
      *
      * Phase 1 — unsigned cache. No JWT, no crypto, no server changes.
      *

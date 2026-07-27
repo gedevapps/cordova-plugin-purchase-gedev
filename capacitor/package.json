@@ -38,6 +38,7 @@
     "dist/",
     "types/",
     "www/",
+    "src/ts/platforms/iaptic-js/iaptic-js-types.d.ts",
     "android/",
     "!android/build",
     "ios/",
