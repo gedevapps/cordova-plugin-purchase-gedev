@@ -50,7 +50,7 @@ The Cordova build used StoreKit 1, which only re-delivers *unfinished* transacti
 - the latest transaction of each auto-renewable subscription,
 - each non-renewing subscription — **including transactions you already finished**.
 
-`restorePurchases()` fires `approved` for the same set — expected restore semantics, unchanged from the Cordova build.
+`restorePurchases()` fires `approved` for the same set.
 
 Consumables are **not** re-delivered this way: they never appear in StoreKit 2's current entitlements. Unfinished consumables are still re-delivered once per launch, exactly as under StoreKit 1.
 
