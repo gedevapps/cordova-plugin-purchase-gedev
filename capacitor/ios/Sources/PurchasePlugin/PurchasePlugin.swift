@@ -46,20 +46,21 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Lifecycle
 
-    override public func load() {
-        if #available(iOS 15.0, *) {
-            startTransactionObserver()
-        }
-    }
-
     deinit {
         if #available(iOS 15.0, *) {
             sk2.transactionObserverTask?.cancel()
         }
     }
 
+    /// Start listening to Transaction.updates. Called at the end of init(),
+    /// NOT at plugin load: Transaction.updates delivers unfinished
+    /// transactions as soon as iteration begins, and before JS called init()
+    /// no listener is attached — the events would be lost while their ids
+    /// still land in processedTransactionIds, hiding unfinished purchases
+    /// for the rest of the session.
     @available(iOS 15.0, *)
     private func startTransactionObserver() {
+        guard sk2.transactionObserverTask == nil else { return }
         sk2.transactionObserverTask = Task.detached { [weak self] in
             for await result in Transaction.updates {
                 guard let self = self else { return }
@@ -73,18 +74,10 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
         let jwsRepresentation = result.jwsRepresentation
         switch result {
         case .verified(let transaction):
-            // Serialize access to processedTransactionIds on the main thread
-            // since this method runs from a detached Task while init()/purchase()
-            // also mutate the set.
-            let shouldEmit: Bool = await MainActor.run {
-                if sk2.processedTransactionIds.contains(transaction.id) {
-                    debugLog("Transaction.updates: skipping duplicate id=\(transaction.id)")
-                    return false
-                }
-                sk2.processedTransactionIds.insert(transaction.id)
-                return true
+            guard await markEmittedToJs(transaction.id) else {
+                debugLog("Transaction.updates: skipping duplicate id=\(transaction.id)")
+                return
             }
-            guard shouldEmit else { return }
             await emitTransactionUpdate(transaction, state: "PaymentTransactionStatePurchased",
                                         jwsRepresentation: jwsRepresentation)
         case .unverified(let transaction, _):
@@ -104,8 +97,9 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
         debugEnabled = call.getBool("debug", false)
         debugLog("init")
 
-        // Load current entitlements and emit to JS so existing subscriptions
-        // are visible immediately on app launch (without requiring a manual restore).
+        // Load current entitlements and unfinished transactions, and emit them
+        // to JS so existing purchases are visible immediately on app launch
+        // (without requiring a manual restore).
         Task {
             for await result in Transaction.currentEntitlements {
                 switch result {
@@ -114,12 +108,10 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
                         debugLog("init: skipping upgraded entitlement id=\(transaction.id) product=\(transaction.productID)")
                         continue
                     }
-                    if self.sk2.processedTransactionIds.contains(transaction.id) {
-                        debugLog("init: skipping already-processed entitlement id=\(transaction.id)")
+                    guard await self.markEmittedToJs(transaction.id) else {
+                        debugLog("init: skipping already-emitted entitlement id=\(transaction.id)")
                         continue
                     }
-                    self.sk2.processedTransactionIds.insert(transaction.id)
-                    self.sk2.unfinishedTransactions[String(transaction.id)] = transaction
                     await self.emitTransactionUpdate(transaction,
                         state: "PaymentTransactionStateRestored",
                         jwsRepresentation: result.jwsRepresentation)
@@ -127,6 +119,26 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
                     debugLog("init: unverified entitlement id=\(transaction.id) product=\(transaction.productID) error=\(error)")
                 }
             }
+            // Emit every transaction the app hasn't finished yet. This is the
+            // only reliable source for unfinished consumables: they never
+            // appear in currentEntitlements, so without this pass an
+            // unfinished consumable would hang in limbo for the session.
+            for await result in Transaction.unfinished {
+                switch result {
+                case .verified(let transaction):
+                    guard await self.markEmittedToJs(transaction.id) else { continue }
+                    debugLog("init: emitting unfinished transaction id=\(transaction.id) product=\(transaction.productID)")
+                    await self.emitTransactionUpdate(transaction,
+                        state: "PaymentTransactionStateRestored",
+                        jwsRepresentation: result.jwsRepresentation)
+                case .unverified(let transaction, let error):
+                    debugLog("init: unverified unfinished transaction id=\(transaction.id) product=\(transaction.productID) error=\(error)")
+                }
+            }
+            // Only now start observing Transaction.updates — see the comment
+            // on startTransactionObserver() for why starting earlier loses
+            // unfinished transactions.
+            self.startTransactionObserver()
             call.resolve()
         }
     }
@@ -206,7 +218,7 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
                     let jwsRepresentation = verification.jwsRepresentation
                     switch verification {
                     case .verified(let transaction):
-                        sk2.processedTransactionIds.insert(transaction.id)
+                        _ = await markEmittedToJs(transaction.id)
                         await emitTransactionUpdate(transaction,
                                                     state: "PaymentTransactionStatePurchased",
                                                     jwsRepresentation: jwsRepresentation)
@@ -296,7 +308,9 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
                             debugLog("restore: skipping upgraded entitlement id=\(transaction.id) product=\(transaction.productID)")
                             continue
                         }
-                        sk2.processedTransactionIds.insert(transaction.id)
+                        // Restore deliberately re-emits transactions already
+                        // delivered this session — mark, but ignore the result.
+                        _ = await markEmittedToJs(transaction.id)
                         await emitTransactionUpdate(transaction,
                                                     state: "PaymentTransactionStateRestored",
                                                     jwsRepresentation: result.jwsRepresentation)
@@ -411,6 +425,21 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
                 // Note: do NOT remove from processedTransactionIds.
                 // The set must grow monotonically to prevent re-delivery via Transaction.updates.
             }
+        }
+    }
+
+    /// Atomically check-and-mark a transaction id as emitted to the JS layer.
+    /// Returns false when it was already emitted this session. "Emitted" is
+    /// unrelated to Apple's finished state — it only prevents duplicate
+    /// delivery of the same transaction within one app session. Serialized on
+    /// the main thread because the Transaction.updates observer runs in a
+    /// detached Task while init()/restore()/purchase() run in their own Tasks.
+    @available(iOS 15.0, *)
+    private func markEmittedToJs(_ id: UInt64) async -> Bool {
+        return await MainActor.run {
+            if sk2.processedTransactionIds.contains(id) { return false }
+            sk2.processedTransactionIds.insert(id)
+            return true
         }
     }
 
