@@ -5,6 +5,10 @@ import StoreKit
 @available(iOS 15.0, *)
 private class SK2State {
     var products: [String: Product] = [:]
+    /// Transactions emitted to JS and not yet finished. Access must be
+    /// serialized on the main thread (same as processedTransactionIds below):
+    /// the Transaction.updates observer runs in a detached Task while
+    /// purchase()/finish() run in their own Tasks.
     var unfinishedTransactions: [String: Transaction] = [:]
     var transactionObserverTask: Task<Void, Never>?
     /// Transaction IDs already emitted to JS. Prevents duplicate delivery when
@@ -81,7 +85,11 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
             await emitTransactionUpdate(transaction, state: "PaymentTransactionStatePurchased",
                                         jwsRepresentation: jwsRepresentation)
         case .unverified(let transaction, _):
-            // Emit as Purchased — let JS layer handle verification
+            // Emit as Purchased — let JS layer handle verification.
+            // Deliberately NOT deduped via markEmittedToJs: marking an
+            // unverified id would suppress the transaction for the rest of
+            // the session even if a later delivery verifies. A double-emit of
+            // the same JWS is harmless — JS re-validates it.
             await emitTransactionUpdate(transaction, state: "PaymentTransactionStatePurchased",
                                         jwsRepresentation: jwsRepresentation)
         }
@@ -126,6 +134,10 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
             for await result in Transaction.unfinished {
                 switch result {
                 case .verified(let transaction):
+                    if transaction.isUpgraded {
+                        debugLog("init: skipping upgraded unfinished transaction id=\(transaction.id) product=\(transaction.productID)")
+                        continue
+                    }
                     guard await self.markEmittedToJs(transaction.id) else { continue }
                     debugLog("init: emitting unfinished transaction id=\(transaction.id) product=\(transaction.productID)")
                     await self.emitTransactionUpdate(transaction,
@@ -266,9 +278,17 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
         debugLog("finish: \(transactionId)")
 
         Task {
-            if let transaction = sk2.unfinishedTransactions[transactionId] {
-                await transaction.finish()
+            // Atomically claim the transaction on the main thread: read and
+            // removal must be one step, or two concurrent finish() calls for
+            // the same id could both proceed. Serialized because the detached
+            // Transaction.updates observer also mutates the dictionary.
+            let transaction: Transaction? = await MainActor.run {
+                guard let t = sk2.unfinishedTransactions[transactionId] else { return nil }
                 sk2.unfinishedTransactions.removeValue(forKey: transactionId)
+                return t
+            }
+            if let transaction = transaction {
+                await transaction.finish()
                 // Note: do NOT remove from processedTransactionIds here.
                 // Once a transaction ID has been emitted to JS, it must stay in the set
                 // for the lifetime of the session to prevent Transaction.updates from
@@ -421,7 +441,9 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
             if let expirationDate = transaction.expirationDate, expirationDate < Date() {
                 debugLog("clearExpired: finishing expired transaction id=\(transaction.id) product=\(transaction.productID) expired=\(expirationDate)")
                 await transaction.finish()
-                sk2.unfinishedTransactions.removeValue(forKey: String(transaction.id))
+                await MainActor.run {
+                    _ = sk2.unfinishedTransactions.removeValue(forKey: String(transaction.id))
+                }
                 // Note: do NOT remove from processedTransactionIds.
                 // The set must grow monotonically to prevent re-delivery via Transaction.updates.
             }
@@ -448,7 +470,10 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
                                        errorCode: Int? = nil, errorText: String? = nil,
                                        jwsRepresentation: String? = nil) async {
         let transactionId = String(transaction.id)
-        sk2.unfinishedTransactions[transactionId] = transaction
+        // Serialized on the main thread — see SK2State.unfinishedTransactions.
+        await MainActor.run {
+            sk2.unfinishedTransactions[transactionId] = transaction
+        }
 
         var data: [String: Any] = [
             "state": state,
