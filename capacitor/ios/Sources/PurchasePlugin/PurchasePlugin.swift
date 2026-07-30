@@ -7,8 +7,9 @@ private class SK2State {
     var products: [String: Product] = [:]
     /// Transactions emitted to JS and not yet finished. Access must be
     /// serialized on the main thread (same as processedTransactionIds below):
-    /// the Transaction.updates observer runs in a detached Task while
-    /// purchase()/finish() run in their own Tasks.
+    /// the detached Transaction.updates observer, emitTransactionUpdate(),
+    /// finish(), and clearExpiredUnfinishedTransactions() all read or
+    /// mutate it from concurrent async contexts.
     var unfinishedTransactions: [String: Transaction] = [:]
     var transactionObserverTask: Task<Void, Never>?
     /// Transaction IDs already emitted to JS. Prevents duplicate delivery when
@@ -235,7 +236,8 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
                                                     state: "PaymentTransactionStatePurchased",
                                                     jwsRepresentation: jwsRepresentation)
                     case .unverified(let transaction, _):
-                        // Emit as Purchased — let JS handle verification
+                        // Emit as Purchased — let JS handle verification.
+                        // Deliberately not deduped — see handleTransactionUpdate.
                         await emitTransactionUpdate(transaction,
                                                     state: "PaymentTransactionStatePurchased",
                                                     jwsRepresentation: jwsRepresentation)
@@ -284,7 +286,7 @@ public class PurchasePlugin: CAPPlugin, CAPBridgedPlugin {
             // Transaction.updates observer also mutates the dictionary.
             let transaction: Transaction? = await MainActor.run {
                 guard let t = sk2.unfinishedTransactions[transactionId] else { return nil }
-                sk2.unfinishedTransactions.removeValue(forKey: transactionId)
+                _ = sk2.unfinishedTransactions.removeValue(forKey: transactionId)
                 return t
             }
             if let transaction = transaction {
