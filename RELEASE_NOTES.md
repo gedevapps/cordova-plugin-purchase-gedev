@@ -2,6 +2,14 @@
 
 ## 13.18
 
+### 13.18.1
+
+#### (android) Preserve entitlements when Google Play returns a partial purchase inventory
+
+Google Play's in-app and subscription queries are asynchronous and can succeed or fail independently. The Cordova bridge now publishes a purchase snapshot only after both queries complete successfully. A failed or temporarily unavailable subscription query is reported as a load error and leaves the last known purchases untouched, instead of treating the missing subscription response as proof that the user no longer owns a product.
+
+The Google Play adapter also distinguishes between the complete inventory delivered by `setPurchases` and the delta delivered by `purchasesUpdated`. Purchases omitted from a live update are no longer cancelled; removal happens only when an authoritative complete snapshot omits them. This prevents a single purchase event from revoking unrelated subscriptions or non-consumables.
+
 ### 13.18.0
 
 #### (feat) OfflineEntitlements — answer "is this product owned?" when the device is offline

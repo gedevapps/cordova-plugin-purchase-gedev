@@ -423,9 +423,6 @@ public final class PurchasePlugin
       .put("quantity", p.getQuantity());
   }
 
-  BillingResult mInAppResult;
-  BillingResult mSubsResult;
-
   /**
    * Query purchases across various use cases and deliver the result in a
    * formalized way through a listener.
@@ -433,37 +430,83 @@ public final class PurchasePlugin
   public void queryPurchases() {
     Log.d(mTag, "queryPurchases()");
     executeServiceRequest(() -> {
-      long time = System.currentTimeMillis();
+      final long time = System.currentTimeMillis();
+      final boolean subscriptionsSupported = areSubscriptionsSupported();
 
-      List<Purchase> allPurchases = new ArrayList<Purchase>();
-      mInAppResult = null;
-      mSubsResult = null;
+      // A missing subscription response must never be interpreted as an empty,
+      // authoritative subscription inventory. This is particularly important
+      // when INAPP succeeds while SUBS fails: reporting the combined request as
+      // successful would make the JavaScript adapter revoke valid entitlements.
+      if (!subscriptionsSupported && !mSubsProductIds.isEmpty()) {
+        callError(Constants.ERR_LOAD,
+            "Failed to query purchases: subscriptions are temporarily unavailable");
+        return;
+      }
+
+      final Object queryLock = new Object();
+      final List<Purchase> allPurchases = new ArrayList<Purchase>();
+      final BillingResult[] inAppResult = new BillingResult[1];
+      final BillingResult[] subsResult = new BillingResult[1];
+      final boolean[] resultDelivered = new boolean[] { false };
+
+      final Runnable finishWhenAllQueriesComplete = () -> {
+        final BillingResult finalResult;
+        final List<Purchase> purchaseSnapshot;
+
+        synchronized (queryLock) {
+          if (resultDelivered[0]
+              || inAppResult[0] == null
+              || (subscriptionsSupported && subsResult[0] == null)) {
+            return;
+          }
+
+          resultDelivered[0] = true;
+
+          // Only a complete successful snapshot may replace the cached
+          // purchases. A partial success is an error, not proof of non-ownership.
+          if (inAppResult[0].getResponseCode() != BillingResponseCode.OK) {
+            finalResult = inAppResult[0];
+          } else if (subscriptionsSupported
+              && subsResult[0].getResponseCode() != BillingResponseCode.OK) {
+            finalResult = subsResult[0];
+          } else {
+            finalResult = inAppResult[0];
+          }
+          purchaseSnapshot = new ArrayList<Purchase>(allPurchases);
+        }
+
+        onQueryPurchasesFinished(finalResult, purchaseSnapshot);
+      };
 
       mBillingClient.queryPurchasesAsync(
         QueryPurchasesParams.newBuilder().setProductType(ProductType.INAPP).build(),
         new PurchasesResponseListener() {
           public void onQueryPurchasesResponse(BillingResult billingResult, List<Purchase> purchases) {
-            mInAppResult = billingResult;
             Log.i(mTag, "queryPurchases(INAPP) -> Elapsed time: " + (System.currentTimeMillis() - time) + "ms");
-            if (billingResult.getResponseCode() == BillingResponseCode.OK)
-              allPurchases.addAll(purchases);
-            if (mInAppResult != null && (mSubsResult != null || !areSubscriptionsSupported()))
-              onQueryPurchasesFinished(mInAppResult.getResponseCode() == BillingResponseCode.OK ? mInAppResult : mSubsResult, allPurchases);
+            synchronized (queryLock) {
+              inAppResult[0] = billingResult;
+              if (billingResult.getResponseCode() == BillingResponseCode.OK) {
+                allPurchases.addAll(purchases);
+              }
+            }
+            finishWhenAllQueriesComplete.run();
           }
         }
       );
 
-      if (areSubscriptionsSupported()) {
+      if (subscriptionsSupported) {
         mBillingClient.queryPurchasesAsync(
           QueryPurchasesParams.newBuilder().setProductType(ProductType.SUBS).build(),
           new PurchasesResponseListener() {
             public void onQueryPurchasesResponse(BillingResult billingResult, List<Purchase> purchases) {
-              mSubsResult = billingResult;
               Log.i(mTag, "queryPurchases(SUBS) -> Elapsed time: " + (System.currentTimeMillis() - time) + "ms");
-              if (billingResult.getResponseCode() == BillingResponseCode.OK)
-                allPurchases.addAll(purchases);
-              if (mInAppResult != null && (mSubsResult != null || !areSubscriptionsSupported()))
-                onQueryPurchasesFinished(mInAppResult.getResponseCode() == BillingResponseCode.OK ? mInAppResult : mSubsResult, allPurchases);
+              synchronized (queryLock) {
+                subsResult[0] = billingResult;
+                if (billingResult.getResponseCode() == BillingResponseCode.OK) {
+                  allPurchases.addAll(purchases);
+                }
+              }
+              finishWhenAllQueriesComplete.run();
             }
           }
         );

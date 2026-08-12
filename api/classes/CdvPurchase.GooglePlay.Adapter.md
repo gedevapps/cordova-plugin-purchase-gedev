@@ -506,8 +506,8 @@ ___
 
 Called when the platform reports updates for some purchases
 
-Notice that purchases can be removed from the array, we should handle that so they stop
-being "owned" by the user.
+This callback can contain only the purchases changed by a live
+billing event, so it must not be treated as a full inventory.
 
 #### Parameters
 

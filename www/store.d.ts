@@ -1046,7 +1046,7 @@ declare namespace CdvPurchase {
     /**
      * Current release number of the plugin.
      */
-    const PLUGIN_VERSION = "13.18.0";
+    const PLUGIN_VERSION = "13.18.1";
     /**
      * Entry class of the plugin.
      */
@@ -4916,8 +4916,8 @@ declare namespace CdvPurchase {
             /**
              * Called when the platform reports updates for some purchases
              *
-             * Notice that purchases can be removed from the array, we should handle that so they stop
-             * being "owned" by the user.
+             * This callback can contain only the purchases changed by a live
+             * billing event, so it must not be treated as a full inventory.
              */
             onPurchasesUpdated(purchases: Bridge.Purchase[]): void;
             onPriceChangeConfirmationResult(result: "OK" | "UserCanceled" | "UnknownProduct"): void;
