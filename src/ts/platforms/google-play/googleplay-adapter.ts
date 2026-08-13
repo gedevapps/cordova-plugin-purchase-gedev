@@ -330,7 +330,7 @@ namespace CdvPurchase {
                 [purchaseToken: string]: {
                     timeoutId: number;
                     refreshTime: number;
-                }[];
+                };
             } = {};
             
             /** Refresh intervals (in milliseconds) */
@@ -345,41 +345,49 @@ namespace CdvPurchase {
             private scheduleRefreshForSubscription(purchase: Bridge.Purchase): void {
                 if (!purchase.purchaseToken) return;
 
-                const schedule = this.refreshSchedule[purchase.purchaseToken] || [];
-                if (schedule.length === 0) {
-                    this.refreshSchedule[purchase.purchaseToken] = schedule;
-                }
+                // A complete purchase snapshot can be delivered many times. Keep
+                // only one timer per purchase token so those snapshots cannot
+                // multiply refresh requests.
+                if (this.refreshSchedule[purchase.purchaseToken]) return;
 
-                // Determine refresh interval based on sandbox status and auto-renewing flag
-                let refreshIntervals = [Adapter.REFRESH_INTERVALS.SANDBOX, Adapter.REFRESH_INTERVALS.PRODUCTION];
-                refreshIntervals.forEach(refreshInterval => {
-                    const refreshTime = purchase.purchaseTime + refreshInterval;
-                    if (schedule.find(s => s.refreshTime === refreshTime) || refreshTime < Date.now()) {
-                        return;
-                    }
-                    this.log.debug(`Scheduling refresh for purchase token ${purchase.purchaseToken} at ${new Date(refreshTime).toISOString()}`);
-                    
-                    // Schedule the refresh
-                    const timeoutId = window.setTimeout(() => {
-                        this.log.debug(`Executing scheduled refresh for purchase token ${purchase.purchaseToken}`);
-                        delete this.refreshSchedule[purchase.purchaseToken];
-                        this.getPurchases().catch(err => {
-                            this.log.warn(`Failed scheduled refresh: ${err}`);
-                        });
-                    }, refreshTime - Date.now());
-                
-                    // Store the scheduled refresh
-                    schedule.push({
-                        timeoutId: timeoutId as unknown as number,
-                        refreshTime
+                const now = Date.now();
+                const refreshTime = [Adapter.REFRESH_INTERVALS.SANDBOX, Adapter.REFRESH_INTERVALS.PRODUCTION]
+                    .map(refreshInterval => purchase.purchaseTime + refreshInterval)
+                    // Timers can fire a few milliseconds early. A small guard
+                    // prevents the just-fired deadline from being scheduled
+                    // again with a zero-millisecond delay.
+                    .find(candidate => candidate > now + 1000);
+
+                if (!refreshTime) return;
+
+                this.log.debug(`Scheduling refresh for purchase token ${purchase.purchaseToken} at ${new Date(refreshTime).toISOString()}`);
+
+                const timeoutId = window.setTimeout(() => {
+                    const currentSchedule = this.refreshSchedule[purchase.purchaseToken];
+
+                    // Ignore a stale callback if this token has since received a
+                    // different schedule.
+                    if (!currentSchedule || currentSchedule.timeoutId !== timeoutId) return;
+
+                    this.log.debug(`Executing scheduled refresh for purchase token ${purchase.purchaseToken}`);
+                    delete this.refreshSchedule[purchase.purchaseToken];
+                    this.getPurchases().catch(err => {
+                        this.log.warn(`Failed scheduled refresh: ${err}`);
                     });
-                });
+                }, refreshTime - now);
+
+                this.refreshSchedule[purchase.purchaseToken] = {
+                    timeoutId: timeoutId as unknown as number,
+                    refreshTime
+                };
             }
             
             /**
              * Detect subscriptions that need scheduled refreshes
              */
             private scheduleRefreshesForSubscriptions(purchases: Bridge.Purchase[]): void {
+                const activeCancelledSubscriptionTokens: { [purchaseToken: string]: true } = {};
+
                 for (const purchase of purchases) {
                     // Skip if not auto-renewing
                     if (purchase.autoRenewing !== false) continue;
@@ -387,9 +395,19 @@ namespace CdvPurchase {
                     const product = productId ? this._products.getProduct(productId) : undefined;
                     if (!product || product.type !== ProductType.PAID_SUBSCRIPTION) continue;
                     if (!purchase.expiryTimeMillis) {
+                        activeCancelledSubscriptionTokens[purchase.purchaseToken] = true;
                         this.scheduleRefreshForSubscription(purchase);
                     }
                 }
+
+                // Cancel timers for purchases no longer returned by Google Play,
+                // or subscriptions whose automatic renewal was enabled again.
+                Object.keys(this.refreshSchedule).forEach(purchaseToken => {
+                    if (activeCancelledSubscriptionTokens[purchaseToken]) return;
+
+                    window.clearTimeout(this.refreshSchedule[purchaseToken].timeoutId);
+                    delete this.refreshSchedule[purchaseToken];
+                });
             }
 
             /**
